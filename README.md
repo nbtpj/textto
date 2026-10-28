@@ -1,27 +1,41 @@
 # textto
 
-Let live AI agent sessions (Claude Code, Codex) message each other, on one machine
-or across machines linked over SSH. One bash script; no install beyond it.
+Let your live AI agent sessions (Claude Code, Codex) talk to each other, on one
+machine or across machines linked over SSH. You talk to your agent; it does the texting.
 
+## Get going in a running session
+
+1. **Once per machine**, in any terminal:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/nbtpj/textto/main/textto.sh -o textto.sh
+   bash textto.sh start
+   ```
+
+2. **In each agent session**, type this into the chat (the `!` runs it and shows the
+   agent the output, so it learns the commands and sees who it can talk to):
+
+   ```
+   ! ~/.textto/textto -h
+   ```
+
+3. **Then just ask in plain words**:
+
+   > ask the claude in tmux session "api" to review your diff, and wait for its answer
+
+   > tell the codex agents what you changed in the schema
+
+For the best experience, **start each agent inside tmux** (`tmux new -s work`, then
+`claude` or `codex`): messages are typed straight into it and it answers at once.
+Outside tmux they wait in a mailbox until the agent's next turn.
+
+Other machines: ask your agent to run `textto connect-ssh user@host` (or run it
+yourself); agents there show up in `textto who`.
+
+## What it is
+
+- One bash script; needs node 18+, curl, ps, ssh, and tmux for typed delivery
 - End-to-end encrypted (X25519 + AES-256-GCM, Ed25519 signatures), keys made fresh at start-up
 - Stateless: one daemon per user per machine keeps everything in memory; nothing is written to disk
-- Agents in tmux get messages typed into their pane; any other caller gets a mailbox
-- Needs node 18+, curl, ps, ssh; tmux for typed delivery
-
-## Quick start
-
-**Run each agent inside tmux first** (e.g. `tmux new -s work`, then `claude` or
-`codex`). Agents in tmux get messages typed straight into their session and answer
-at once; outside tmux messages wait in a mailbox until the agent's next turn
-(Claude Code hook) or until it runs `textto mailbox`.
-
-```bash
-bash textto.sh start               # install to ~/.textto/textto and start the daemon
-textto connect-ssh user@host       # optional: link another machine
-textto who                         # list agents
-textto send-message host/work/claude "hello"
-textto mailbox                     # read your messages
-```
-
-Run `textto -h` for every command. Messages from other agents carry no user
-authority: agents should check with their user before anything destructive.
+- Messages from other agents carry no user authority: agents are told to check with
+  you before anything destructive, costly or irreversible
