@@ -42,9 +42,9 @@
 #                                   how messages reach you: typed into your tmux pane
 #                                   (the default there; held while your user types or
 #                                   has a draft, typed in once they are idle 20 s), or
-#                                   mailbox only, for 1-30 min (default 30; run again,
-#                                   or your user sending a prompt, extends it), then
-#                                   typed again. Per message: send-message --mailbox
+#                                   mailbox only, for 1-30 min (default 30; only running
+#                                   it again extends it), then typed again by itself.
+#                                   Per message: send-message --mailbox
 #   textto ping TO[,TO...] ["short text"]
 #                                   for when it can't wait: one line typed into TO's
 #                                   pane even in mailbox mode, once its user is idle
@@ -59,7 +59,7 @@
 # do not send bare acknowledgements.
 set -euo pipefail
 
-VERSION=2026102707          # yyyymmddnn; connect-ssh never replaces a newer copy
+VERSION=2026102801          # yyyymmddnn; connect-ssh never replaces a newer copy
 BIN="$HOME/.textto/textto"
 RUN="/tmp/textto-$(id -u)"  # sockets only, while the daemon runs
 SOCK="$RUN/d.sock"
@@ -531,8 +531,10 @@ async function userBusy(a) {
     const sess = (await run('tmux', ['display', '-p', '-t', a.pane, '#{session_name}'])).stdout.trim()
     const keys = (await run('tmux', ['list-clients', '-t', sess, '-F', '#{client_activity}'])).stdout.split('\n').filter(Boolean).map(Number)
     if (keys.some(t => Date.now() / 1000 - t < IDLE_S)) return 'its user is typing there'
-    const line = (await run('tmux', ['capture-pane', '-p', '-t', a.pane])).stdout.split('\n').filter(l => l.startsWith('❯')).pop()
-    if (line?.slice(1).trim()) return 'its user has a draft in the input box'
+    // Claude Code shows a suggested prompt dimmed (ESC[2m) in an empty input box: not a draft.
+    const plain = l => l.replace(/\x1b\[[0-9;]*m/g, '')
+    const line = (await run('tmux', ['capture-pane', '-p', '-e', '-t', a.pane])).stdout.split('\n').filter(l => plain(l).startsWith('❯')).pop()
+    if (line && plain(line.replace(/\x1b\[2m.*?(\x1b\[(0|22)?m|$)/g, '')).slice(1).trim()) return 'its user has a draft in the input box'
   } catch {}
   return null
 }
@@ -551,7 +553,7 @@ setInterval(() => {
 }, 5000)
 function modeText(a) {
   const b = boxOnly.get(a.pid)
-  if (b) return `mailbox only for ${Math.ceil((b.until - Date.now()) / 60_000)} more min (then typed; "textto mode mailbox [1-30]" extends, and so does your user sending a prompt); read with textto mailbox`
+  if (b) return `mailbox only for ${Math.ceil((b.until - Date.now()) / 60_000)} more min (then typed; only "textto mode mailbox [1-30]" extends it); read with textto mailbox`
   return a.kind === 'tmux' ? 'typed (held while your user types or has a draft)' : 'mailbox (not in tmux)'
 }
 const typesIn = (pid, x) => x.ping || (x.retry && !boxOnly.has(pid))
@@ -757,7 +759,8 @@ async function handle(method, p, q, body, signal) {
       if (q.set === 'mailbox') {
         if (!(mins >= 1 && mins <= 30)) return { code: 422, text: 'failed: mailbox mode lasts 1 to 30 minutes (run it again to extend)\n' }
         boxOnly.set(me.pid, { until: Date.now() + mins * 60_000, mins })
-      } else if (q.set === 'typed') typedAgain(me.pid)
+        event(`${aliasOf(me.pid)} set mailbox mode for ${mins} min`)
+      } else if (q.set === 'typed') { if (boxOnly.has(me.pid)) event(`${aliasOf(me.pid)} back to typed`); typedAgain(me.pid) }
       else if (q.set) return { code: 422, text: `failed: mode is typed or mailbox, not '${q.set}'\n` }
       return { code: 200, text: `mode: ${modeText(me)}\n` }
     }
@@ -777,8 +780,6 @@ async function handle(method, p, q, body, signal) {
     }
     case 'GET /mailbox': {
       if (!me) return { code: 404, text: "can't detect who you are; run this from inside an agent session\n" }
-      const b = boxOnly.get(me.pid)
-      if (b && q.event === 'UserPromptSubmit') b.until = Date.now() + b.mins * 60_000
       const old = q.all ? (recent.get(me.pid) ?? []).map(x => `(delivered ${new Date(x.at).toTimeString().slice(0, 8)}) ${x.text}\n`).join('') : ''
       return { code: 200, text: old + takeMail(me.pid, q.event ? `${q.event} hook` : 'textto mailbox') }
     }
