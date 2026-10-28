@@ -10,6 +10,11 @@ or across machines linked over SSH. One bash script; no install beyond it.
 
 ## Quick start
 
+**Run each agent inside tmux first** (e.g. `tmux new -s work`, then `claude` or
+`codex`). Agents in tmux get messages typed straight into their session and answer
+at once; outside tmux messages wait in a mailbox until the agent's next turn
+(Claude Code hook) or until it runs `textto mailbox`.
+
 ```bash
 bash textto.sh start               # install to ~/.textto/textto and start the daemon
 textto connect-ssh user@host       # optional: link another machine

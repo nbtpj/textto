@@ -1099,6 +1099,8 @@ Not running on this machine yet. To set it up (ask your user first if you are an
                                  and adds two Claude Code hooks to ~/.claude/settings.json
                                  (they hand mailbox messages to Claude at its next turn)
   textto connect-ssh HOST        optional: link with another machine over SSH
+Best experience: start each agent inside tmux (tmux new -s work, then claude or
+codex), so messages are typed straight into it instead of waiting in a mailbox.
 Any other command also starts it, without the hooks. Needs node 18+, curl, ps; tmux
 for typing messages into agents. Nothing is stored: textto stop leaves no trace.
 HELP
