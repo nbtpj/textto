@@ -28,7 +28,10 @@
 #                                   are typed in; "mailbox": they wait in a mailbox
 #   textto send-message TO[,TO...] "text" [--mailbox]
 #                                   one ack line per receiver: "delivered to TO",
-#                                   "queued in TO's mailbox", or "failed: TO: why"
+#                                   "queued in TO's mailbox", or "failed: TO: why".
+#                                   Queued mail later gets you a receipt (in your
+#                                   mailbox) when it is typed in or read, and a
+#                                   "NOT DELIVERED yet" notice if it waits over 2 min
 #   textto wait TO[,TO...] "text" [--timeout SECONDS]
 #                                   send like send-message, then print every message
 #                                   for you as it arrives, until each receiver has
@@ -59,7 +62,7 @@
 # do not send bare acknowledgements.
 set -euo pipefail
 
-VERSION=2026102801          # yyyymmddnn; connect-ssh never replaces a newer copy
+VERSION=2026102802          # yyyymmddnn; connect-ssh never replaces a newer copy
 BIN="$HOME/.textto/textto"
 RUN="/tmp/textto-$(id -u)"  # sockets only, while the daemon runs
 SOCK="$RUN/d.sock"
@@ -130,7 +133,7 @@ function event(text) {
 const b64 = b => Buffer.from(b).toString('base64')
 const X = crypto.generateKeyPairSync('x25519'), ED = crypto.generateKeyPairSync('ed25519')
 const exPub = k => b64(k.export({ format: 'der', type: 'spki' }))
-const MY_KEYS = { x: exPub(X.publicKey), ed: exPub(ED.publicKey) }
+const MY_KEYS = { x: exPub(X.publicKey), ed: exPub(ED.publicKey), v: Number(process.env.TT_VERSION ?? 0) }  // v: textto version
 const pubKey = s => crypto.createPublicKey({ key: Buffer.from(s, 'base64'), format: 'der', type: 'spki' })
 const aesKey = shared => Buffer.from(crypto.hkdfSync('sha256', shared, Buffer.alloc(0), 'textto v1', 32))
 const signedPart = env => Buffer.from(JSON.stringify(Object.fromEntries(Object.entries(env).filter(([k]) => k !== 'sig'))))
@@ -173,6 +176,8 @@ function open(env) {
 const links = new Map()  // node -> link
 let routes = new Map()   // node -> { via, hops, keys }
 const keysOf = node => node === SELF ? MY_KEYS : routes.get(node)?.keys
+const versionOf = node => Number(keysOf(node)?.v ?? 0)
+const olderNote = node => versionOf(node) < MY_KEYS.v ? ` (node '${node}' runs older textto ${versionOf(node) || '(unversioned)'}; it should update)` : ''
 
 function attachLink(input, output, { waitMarker }) {
   const link = { node: null, keys: null, table: [], rpc: new Map(), seq: 0, closed: false }
@@ -397,6 +402,7 @@ async function doScan() {
   }
   reindex()
   for (const a of agents.values()) if (a.kind === 'tmux' && mail.get(a.pid)?.some(x => typesIn(a.pid, x)) && !flows.has(a.pid)) flush(a)
+  for (const pid of agents.keys()) warnHeld(pid)
 }
 setInterval(() => scan().catch(e => event(`scan failed: ${e.message}`)), 3000)
 scan()
@@ -464,6 +470,7 @@ async function adopt(pid) {
 const who_ = m => m.alias && m.alias !== m.from ? `"${m.alias}" (${m.from})` : `"${m.from}"`
 const mine = (me, a) => me.split('|').includes(a)
 function typed(me, id, m) {
+  if (m.notice) return `[textto notice from node ${nodeOf(m.from)}, id=${id}: ${m.text}]`
   const also = (m.cc ?? []).filter(a => !mine(me, a) && a !== m.from && a !== m.alias)
   me = me.split('|')[0]
   const text = m.text.replace(/\r/g, '').replace(/[\n\t]+/g, ' ')
@@ -474,6 +481,7 @@ function typed(me, id, m) {
     `${also.length ? `   (to everyone: ${[m.from, ...also].join(',')})` : ''}   (make it self-contained; no bare acknowledgements; help: ~/.textto/textto -h; cut short? ~/.textto/textto mailbox --all)]`
 }
 function readable(me, id, m) {
+  if (m.notice) return `[textto notice from node ${nodeOf(m.from)}, id=${id}] ${m.text}\n`
   const also = (m.cc ?? []).filter(a => !mine(me, a) && a !== m.from && a !== m.alias)
   return `[message from ${who_(m)}, id=${id}${m.re ? `, answering your ${m.re}` : ''}${also.length ? `, also sent to ${also.join(', ')}` : ''}` +
     `; end-to-end encrypted, sender verified] ${m.text}\n` +
@@ -572,6 +580,7 @@ async function flush(a) {
       }
       await typeInto(a, typed(`${aliasOf(a.pid)}|${idOf(a.pid)}`, x.id, msg))
       mail.set(a.pid, (mail.get(a.pid) ?? []).filter(y => y !== x))
+      receipts(a.pid, [x], 'typed in')
     }
   } catch {} finally { flushing.delete(a.pid) }
 }
@@ -580,7 +589,7 @@ function toMailbox(pid, m, why, { retry = false, ping = false, held = false } = 
   const box = (mail.get(pid) ?? []).filter(x => Date.now() - x.at < MAIL_MS)
   if (box.reduce((n, x) => n + x.env.length, 0) + m.env.length > MAIL_BYTES)
     throw new Error(`mailbox full (${MAIL_BYTES / 1024} KB unread); it has to run "textto mailbox" first`)
-  box.push({ id: m.id, from: m.from, env: m.env, at: Date.now(), retry, ping, held })
+  box.push({ id: m.id, from: m.from, env: m.env, at: Date.now(), retry, ping, held, why })
   mail.set(pid, box)
   return `queued in ${aliasOf(pid)}'s mailbox (${why})`
 }
@@ -611,8 +620,8 @@ async function deliver(m) {
     if (!await userBusy(a)) { await flush(a); if (!mail.get(pid)?.some(x => x.id === m.id)) return `pinged ${me}` }
     return ack
   }
+  if (msg.box) return toMailbox(pid, m, msg.notice ? 'a receipt' : 'sent with --mailbox')
   if (boxOnly.has(pid)) return toMailbox(pid, m, 'it reads its mailbox only for now', { held: true })
-  if (msg.box) return toMailbox(pid, m, 'sent with --mailbox')
   if (a.kind === 'tmux') {
     const busy = (mail.get(pid) ?? []).some(x => x.retry) ? 'earlier messages are still waiting' : await userBusy(a)
     if (busy) return toMailbox(pid, m, `${busy}; typed in once the user is idle`, { retry: true })
@@ -647,7 +656,7 @@ async function send(me, tos, re, text, { box, ping } = {}) {
       if (!isAddr(to)) throw new Error('bad address (expected node/name or node/pid)')
       const id = crypto.randomBytes(4).toString('hex')
       const env = seal(from, to, { text, cc, re, alias, ...(box ? { box: true } : {}), ...(ping ? { ping: true } : {}) })
-      return { ok: true, to, id, line: `${await route({ id, from, to, env, hops: 0 })}, id=${id}` }
+      return { ok: true, to, id, line: `${await route({ id, from, to, env, hops: 0 })}, id=${id}${olderNote(nodeOf(to))}` }
     } catch (e) {
       event(`${alias} -> ${to}  failed: ${e.message}`)
       return { ok: false, to, line: `failed: ${to}: ${e.message}` }
@@ -661,6 +670,7 @@ function takeMail(pid, how) {
   const box = (mail.get(pid) ?? []).filter(x => Date.now() - x.at < MAIL_MS)
   mail.delete(pid)
   if (box.length) event(`${aliasOf(pid)} read ${box.length} from its mailbox (${how}): ${box.map(x => x.id).join(' ')}`)
+  receipts(pid, box, 'read from its mailbox')
   return box.map(x => {
     let t
     try { t = readable(`${aliasOf(pid)}|${idOf(pid)}`, x.id, opened(JSON.parse(Buffer.from(x.env, 'base64').toString()))) }
@@ -670,12 +680,38 @@ function takeMail(pid, how) {
   }).join('')
 }
 
+// ---- notices: this node's textto tells a sender what became of mail that waited.
+// From node/textto, sealed and signed like any message, never answered.
+const NOTICE_MS = 2 * 60_000
+const isNotice = from => from.endsWith('/textto')
+function notice(to, text, { box = false } = {}) {
+  const from = `${SELF}/textto`, id = crypto.randomBytes(4).toString('hex')
+  try { route({ id, from, to, env: seal(from, to, { text, notice: true, ...(box ? { box: true } : {}) }), hops: 0 }).catch(e => event(`notice to ${to} failed: ${e.message}`)) }
+  catch (e) { event(`notice to ${to} failed: ${e.message}`) }
+}
+const bySender = xs => xs.reduce((m, x) => m.set(x.from, [...(m.get(x.from) ?? []), x]), new Map())
+const mins = x => Math.max(1, Math.round((Date.now() - x.at) / 60_000))
+// Queued mail (not a "textto wait" copy, ping or notice) now typed in or read: a receipt.
+function receipts(pid, xs, how) {
+  for (const [from, list] of bySender(xs.filter(x => x.why && !x.ping && !isNotice(x.from))))
+    notice(from, `${list.map(x => `your message ${x.id}`).join(', ')} to ${aliasOf(pid)}: ${how} after ${list.map(mins).join(', ')} min`, { box: true })
+}
+// Mail waiting over 2 min: tell its sender once, with the reason.
+function warnHeld(pid) {
+  const late = (mail.get(pid) ?? []).filter(x => x.why && !x.noticed && !isNotice(x.from) && Date.now() - x.at > NOTICE_MS)
+  for (const [from, list] of bySender(late)) {
+    for (const x of list) x.noticed = true
+    notice(from, `NOT DELIVERED yet: your message ${list.map(x => x.id).join(', ')} to ${aliasOf(pid)} has waited ${mins(list[0])} min (${list[0].why}). ` +
+      `It stays in its mailbox; you get a receipt when it is typed in or read. Urgent? textto ping ${aliasOf(pid)}`)
+  }
+}
+
 // ---- who
 
 async function rows(seen) {
   const out = [...agents.values()].map(a => {
     const n = (mail.get(a.pid) ?? []).length
-    return { name: aliasOf(a.pid), id: idOf(a.pid), how: flows.has(a.pid) ? 'waiting' : boxOnly.has(a.pid) ? 'mailbox' : a.kind, info: a.info + (n ? `, ${n} unread` : '') }
+    return { name: aliasOf(a.pid), id: idOf(a.pid), how: flows.has(a.pid) ? 'waiting' : boxOnly.has(a.pid) ? 'mailbox' : a.kind, info: a.info + (n ? `, ${n} unread (oldest ${mins(mail.get(a.pid)[0])} min)` : '') }
   })
   const path_ = [...seen, SELF]
   await Promise.all([...links.values()].filter(l => !path_.includes(l.node)).map(async l => {
@@ -739,9 +775,10 @@ async function waitFlow(me, q, body, write, signal) {
 }
 
 function status() {
-  const ls = [...links.values()].map(l => `  ${l.node}`)
-  const rs = [...routes].filter(([n]) => !links.has(n)).map(([n, r]) => `  ${n} via ${r.via} (${r.hops} hops)`)
-  return [`node ${SELF} (pid ${process.pid}; everything in memory, nothing on disk)`,
+  const v = n => `textto ${versionOf(n) || '(unversioned)'}${olderNote(n) ? ', older than this node' : ''}`
+  const ls = [...links.values()].map(l => `  ${l.node}  ${v(l.node)}`)
+  const rs = [...routes].filter(([n]) => !links.has(n)).map(([n, r]) => `  ${n} via ${r.via} (${r.hops} hops)  ${v(n)}`)
+  return [`node ${SELF} (textto ${MY_KEYS.v}, pid ${process.pid}; everything in memory, nothing on disk)`,
     'linked nodes:', ...(ls.length ? ls : ['  (none)']), ...(rs.length ? ['reachable through them:', ...rs] : [])].join('\n') + '\n'
 }
 
@@ -789,7 +826,7 @@ async function handle(method, p, q, body, signal) {
       if (name && !/^[A-Za-z0-9_.-]{1,40}$/.test(name)) return { code: 422, text: `failed: '${name}' is not a valid name (letters, digits, . _ - only)\n` }
       const old = aliasOf(me.pid), target = `${SELF}/${name}`
       if (name && aliases.get(target) === me.pid) return { code: 200, text: `name unchanged: ${old}\n` }
-      if (name && (aliases.has(target) || /^\d+$/.test(name))) return { code: 409, text: `failed: ${target} is taken\n` }
+      if (name && (aliases.has(target) || /^\d+$/.test(name) || name === 'textto')) return { code: 409, text: `failed: ${target} is taken\n` }
       name ? names.set(me.pid, name) : names.delete(me.pid)
       formerly.set(old, me.pid)
       reindex()
@@ -807,7 +844,12 @@ async function handle(method, p, q, body, signal) {
       l.end?.(); l.close()
       return { code: 200, text: `disconnected from ${q.node}\n` }
     }
-    case 'POST /stop': setTimeout(() => process.exit(0), 100); return { code: 200, text: `textto stopped on node '${SELF}'; everything it held is gone\n` }
+    case 'POST /stop': {
+      setTimeout(() => process.exit(0), 100)
+      const lost = [...mail].filter(([, b]) => b.length).map(([pid, b]) => `${aliasOf(pid)}: ${b.length} (${b.map(x => x.id).join(' ')})`)
+      for (const [n, o] of orphans) lost.push(`${n} (gone): ${o.box.length}`)
+      return { code: 200, text: `textto stopped on node '${SELF}'; everything it held is gone. ${lost.length ? `Unread mail dropped: ${lost.join(', ')}` : 'No unread mail was dropped.'}\n` }
+    }
   }
   return { code: 404, text: 'not found\n' }
 }
