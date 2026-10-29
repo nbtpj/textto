@@ -62,7 +62,7 @@
 # do not send bare acknowledgements.
 set -euo pipefail
 
-VERSION=2026102902          # yyyymmddnn; connect-ssh never replaces a newer copy
+VERSION=2026102903          # yyyymmddnn; connect-ssh never replaces a newer copy
 BIN="$HOME/.textto/textto"
 RUN="/tmp/textto-$(id -u)"  # sockets only, while the daemon runs
 SOCK="$RUN/d.sock"
@@ -162,7 +162,7 @@ function verify(envB64, from, to) {  // at the receiving node, on arrival
 }
 
 // The sender comes from the signed envelope; text, cc and re from the sealed payload.
-const opened = env => ({ ...open(env), from: env.from })
+const opened = env => ({ ...open(env), from: env.from, ts: env.ts })
 
 function open(env) {
   const d = crypto.createDecipheriv('aes-256-gcm',
@@ -475,10 +475,14 @@ const who_ = m => m.alias && m.alias !== m.from ? `"${m.alias}" (${m.from})` : `
 const mine = (me, a) => me.split('|').includes(a)
 // A message reads as a message: sender, id, the text, and the reply command. No
 // instructions to the reader; those live in textto -h.
+// "15:08 GMT+8": the sender's clock and time zone, written by the sender.
+const clock = t => new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false, timeZoneName: 'short' }).format(t)
 function head(me, id, m) {
+  const waited = m.queued ? Date.now() - m.queued : 0  // held in a mailbox: when it reached the reader
+  const late = waited > 60_000 ? `, delivered ${clock(Date.now())} after ${Math.round(waited / 60_000)} min` : ''
   const also = (m.cc ?? []).filter(a => !mine(me, a) && a !== m.from && a !== m.alias)
   const reply = `[reply: ~/.textto/textto send-message ${m.from} --re ${id} 'text'${also.length ? `; to all: ${[m.from, ...also].join(',')}` : ''}]`
-  return [`[from ${m.alias || m.from}, id=${id}${m.re ? `, re ${m.re}` : ''}${also.length ? `, also to ${also.join(',')}` : ''}]`, reply]
+  return [`[${m.sent ?? clock(m.ts)} from ${m.alias || m.from}, id=${id}${m.re ? `, re ${m.re}` : ''}${also.length ? `, also to ${also.join(',')}` : ''}${late}]`, reply]
 }
 function typed(me, id, m) {
   if (m.notice) return `[textto notice from node ${nodeOf(m.from)}, id=${id}: ${m.text}]`
@@ -581,7 +585,7 @@ async function flush(a) {
         await typeInto(a, `[textto ping from ${who_(msg)}: ${msg.text.replace(/\s+/g, ' ')}. ${n} unread: run ~/.textto/textto mailbox]`)
         continue
       }
-      await typeInto(a, typed(`${aliasOf(a.pid)}|${idOf(a.pid)}`, x.id, msg))
+      await typeInto(a, typed(`${aliasOf(a.pid)}|${idOf(a.pid)}`, x.id, { ...msg, queued: x.at }))
       mail.set(a.pid, (mail.get(a.pid) ?? []).filter(y => y !== x))
       receipts(a.pid, [x], 'typed in')
     }
@@ -658,7 +662,7 @@ async function send(me, tos, re, text, { box, ping } = {}) {
     try {
       if (!isAddr(to)) throw new Error('bad address (expected node/name or node/pid)')
       const id = crypto.randomBytes(4).toString('hex')
-      const env = seal(from, to, { text, cc, re, alias, ...(box ? { box: true } : {}), ...(ping ? { ping: true } : {}) })
+      const env = seal(from, to, { text, cc, re, alias, sent: clock(Date.now()), ...(box ? { box: true } : {}), ...(ping ? { ping: true } : {}) })
       return { ok: true, to, id, line: `${await route({ id, from, to, env, hops: 0 })}, id=${id}${olderNote(nodeOf(to))}` }
     } catch (e) {
       event(`${alias} -> ${to}  failed: ${e.message}`)
@@ -676,7 +680,7 @@ function takeMail(pid, how) {
   receipts(pid, box, 'read from its mailbox')
   return box.map(x => {
     let t
-    try { t = readable(`${aliasOf(pid)}|${idOf(pid)}`, x.id, opened(JSON.parse(Buffer.from(x.env, 'base64').toString()))) }
+    try { t = readable(`${aliasOf(pid)}|${idOf(pid)}`, x.id, { ...opened(JSON.parse(Buffer.from(x.env, 'base64').toString())), queued: x.at }) }
     catch (e) { t = `[message from ${x.from}, id=${x.id}: could not be opened: ${e.message}]\n` }
     keep(pid, t.trimEnd())
     return t
