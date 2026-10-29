@@ -62,7 +62,7 @@
 # do not send bare acknowledgements.
 set -euo pipefail
 
-VERSION=2026102901          # yyyymmddnn; connect-ssh never replaces a newer copy
+VERSION=2026102902          # yyyymmddnn; connect-ssh never replaces a newer copy
 BIN="$HOME/.textto/textto"
 RUN="/tmp/textto-$(id -u)"  # sockets only, while the daemon runs
 SOCK="$RUN/d.sock"
@@ -296,17 +296,21 @@ function connect(args) {
       if (!done) { done = true; clearTimeout(timer); reject(new Error('the ssh link closed before the other side answered')) }
       if (wanted.has(key)) {
         event(`- node ${link.node ?? args.at(-1)} link lost; retrying every 10s`)
-        setTimeout(() => { if (wanted.has(key)) connect(args).catch(() => {}) }, 10_000)
+        // Not if another link to that node is up meanwhile (two links race to start one daemon).
+        setTimeout(() => { if (wanted.has(key) && !links.has(wanted.get(key))) connect(args).catch(() => {}) }, 10_000)
       }
     }
     p.on('error', e => { link.close(); if (!done) { done = true; reject(e) } })
   })
 }
 
-// Incoming links: "textto _bridge" connects here.
-fs.rmSync(LINK_SOCK, { force: true })
-net.createServer(sock => attachLink(sock, sock, { waitMarker: false }).end = () => sock.destroy())
-  .listen(LINK_SOCK, () => fs.chmodSync(LINK_SOCK, 0o600))
+// Incoming links: "textto _bridge" connects here. Opened once this daemon owns the API
+// socket (below).
+function listenLinks() {
+  fs.rmSync(LINK_SOCK, { force: true })
+  net.createServer(sock => attachLink(sock, sock, { waitMarker: false }).end = () => sock.destroy())
+    .listen(LINK_SOCK, () => fs.chmodSync(LINK_SOCK, 0o600))
+}
 
 // ---- agents on this node, keyed by process id. The canonical address is
 // node/<pid>; names (node/tmux-session/agent, node/folder/program, or one picked
@@ -833,6 +837,8 @@ async function handle(method, p, q, body, signal) {
       return { code: 200, text: `name updated: ${old} -> ${aliasOf(me.pid)}   (always also ${idOf(me.pid)}; ${old} still reaches you unless someone takes it)\n` }
     }
     case 'POST /link': {
+      const n = wanted.get(body)
+      if (n && links.has(n)) return { code: 200, text: `linked: ${SELF} <-> ${n} (already)\n` }
       try { return { code: 200, text: `linked: ${SELF} <-> ${await connect(JSON.parse(body))}\n` } }
       catch (e) { return { code: 502, text: `failed: ${e.message}\n` } }
     }
@@ -853,8 +859,7 @@ async function handle(method, p, q, body, signal) {
   return { code: 404, text: 'not found\n' }
 }
 
-fs.rmSync(SOCK, { force: true })
-http.createServer(async (req, res) => {
+const api = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://textto')
   const q = Object.fromEntries(url.searchParams)
   try {
@@ -881,8 +886,22 @@ http.createServer(async (req, res) => {
     if (!res.headersSent) res.writeHead(500)
     res.end(`failed: ${e.message}\n`)
   }
-}).listen(SOCK, () => { fs.chmodSync(SOCK, 0o600); event(`node ${SELF} started`) })
-  .requestTimeout = 0
+})
+api.requestTimeout = 0
+// One daemon per user per machine, and the API socket is the lock. Two links can start
+// a daemon at the same moment; the one that finds a live daemon here leaves without
+// touching its sockets. A socket nobody answers on is stale and taken over.
+let owner = false
+function claim(again = true) {
+  api.once('error', e => {
+    if (!['EADDRINUSE', 'EEXIST'].includes(e.code) || !again) { console.error(`textto: ${e.message}`); process.exit(1) }
+    const probe = net.connect(SOCK)
+    probe.on('connect', () => { probe.destroy(); process.exit(0) })
+    probe.on('error', () => { fs.rmSync(SOCK, { force: true }); claim(false) })
+  })
+  api.listen(SOCK, () => { owner = true; fs.chmodSync(SOCK, 0o600); listenLinks(); event(`node ${SELF} started`) })
+}
+claim()
 
 // Sandboxed agents (Codex) may not reach the socket: they leave a pair of FIFOs
 // here, "<x>.req" (request in) and "<x>.res" (answer out). Pipes, so nothing
@@ -890,6 +909,7 @@ http.createServer(async (req, res) => {
 const busy = new Set()
 setInterval(() => {
   let files = []
+  if (!owner) return
   try { files = fs.readdirSync(RUN) } catch { return }
   for (const f of files) {
     if (!f.endsWith('.req')) continue
@@ -910,6 +930,7 @@ setInterval(() => {
 
 for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => process.exit(0))
 process.on('exit', () => {
+  if (!owner) return  // a second daemon that found the first: leave its sockets alone
   for (const l of links.values()) l.end?.()
   let files = []
   try { files = fs.readdirSync(RUN) } catch {}
