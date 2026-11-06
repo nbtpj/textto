@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# textto: live AI agent sessions (Claude Code, Codex) message each other, on one
+# textto: live AI agent sessions (Claude Code, Codex, Antigravity) message each other, on one
 # machine or across machines linked over SSH. End-to-end encrypted, and stateless:
 # everything lives in one daemon's memory per machine, nothing is written to disk.
 # Stop it, or lose a link, and what it knew is simply gone.
@@ -9,9 +9,9 @@
 # memory, max 256 KB each. Needs only node, ssh, curl, ps, and tmux for typing.
 #
 # Every caller is identified by its process: the address is node/<pid>, e.g.
-# server/12345. Names are aliases: node/tmux-session/agent for claude or codex
-# in tmux (e.g. server/work/claude), node/folder/program otherwise, or one picked
-# with rename. Claude/Codex in tmux get messages typed in ("delivered"); any other
+# server/12345. Names are aliases: node/tmux-session/agent for claude, codex or
+# agy in tmux (e.g. server/work/claude), node/folder/program otherwise, or one picked
+# with rename. Claude/Codex/agy in tmux get messages typed in ("delivered"); any other
 # caller gets them in its mailbox ("queued"), registered on its first textto call.
 #
 # Setup
@@ -39,8 +39,8 @@
 #                                   tail: copies also stay in your mailbox until the
 #                                   wait ends, so textto mailbox sees them meanwhile
 #   textto mailbox [--all]          read (and empty) your mailbox; --all also shows
-#                                   the last 20 already delivered. Claude Code gets
-#                                   it automatically at its next turn
+#                                   the last 20 already delivered. Claude Code and
+#                                   agy get it automatically at their next turn
 #   textto mode [typed | mailbox [MINUTES]]
 #                                   how messages reach you: typed into your tmux pane
 #                                   (the default there; held while your user types or
@@ -64,11 +64,11 @@
 # your user (and whoever runs textto) at once, with the command and its output.
 set -euo pipefail
 
-VERSION=2026102904          # yyyymmddnn; connect-ssh never replaces a newer copy
+VERSION=2026110601          # yyyymmddnn; connect-ssh never replaces a newer copy
 BIN="$HOME/.textto/textto"
 RUN="/tmp/textto-$(id -u)"  # sockets only, while the daemon runs
 SOCK="$RUN/d.sock"
-AGENTS="claude codex"       # programs that count as agent sessions
+AGENTS=${TT_AGENTS:-"claude codex agy"}  # programs that count as agent sessions
 
 die() { echo "textto: $*" >&2; exit 1; }
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$BIN" 2> /dev/null \
@@ -100,7 +100,7 @@ const run = promisify(execFile)
 const SELF = process.env.TT_NODE
 const RUN = process.env.TT_RUN
 const SOCK = path.join(RUN, 'd.sock'), LINK_SOCK = path.join(RUN, 'l.sock')
-const AGENTS = (process.env.TT_AGENTS || 'claude codex').split(' ')
+const AGENTS = (process.env.TT_AGENTS || 'claude codex agy').split(/\s+/).filter(Boolean)
 const MAX_HOPS = 8
 const MAIL_BYTES = 256 * 1024
 const MAIL_MS = 24 * 3600_000
@@ -383,7 +383,7 @@ async function doScan() {
       .map(([, pid, ppid, tty, stat, comm]) => ({ pid, ppid, tty, fg: stat.includes('+'), prog: path.basename(comm) }))
     await realNames(procs)
   } catch {}
-  // The agent in a pane: the foreground claude/codex process on the pane's terminal, not
+  // The agent in a pane: the foreground claude/codex/agy process on the pane's terminal, not
   // one of its helpers. Found with ps, because tmux may show a process title instead
   // (Claude Code on macOS shows its version number).
   const found = panes.map(([pane, sess, win, idx, cwd, tty]) => {
@@ -539,10 +539,14 @@ function keep(pid, text, how = '') {
 }
 
 // Is the user at this pane? A tmux client on its session pressed a key in the last
-// 20 s, or Claude Code's input line holds a draft. Then a message waits (in the
+// 20 s, or the agent's input line holds a draft. Then a message waits (in the
 // mailbox, marked to retry) and is typed in once the user is idle, never into
 // the middle of what they type.
 const IDLE_S = 20
+// The input line starts with the prompt mark: "❯ " in Claude Code, "> " in agy
+// (Antigravity CLI), drawn in the box above its footer. Busy agents of both kinds
+// queue what is typed in, so only a draft holds a message.
+const PROMPT = { agy: /^>(\s|$)/ }, CLAUDE_PROMPT = /^❯/
 async function userBusy(a) {
   try {
     const sess = (await run('tmux', ['display', '-p', '-t', a.pane, '#{session_name}'])).stdout.trim()
@@ -550,7 +554,8 @@ async function userBusy(a) {
     if (keys.some(t => Date.now() / 1000 - t < IDLE_S)) return 'its user is typing there'
     // Claude Code shows a suggested prompt dimmed (ESC[2m) in an empty input box: not a draft.
     const plain = l => l.replace(/\x1b\[[0-9;]*m/g, '')
-    const line = (await run('tmux', ['capture-pane', '-p', '-e', '-t', a.pane])).stdout.split('\n').filter(l => plain(l).startsWith('❯')).pop()
+    const mark = PROMPT[a.prog] ?? CLAUDE_PROMPT
+    const line = (await run('tmux', ['capture-pane', '-p', '-e', '-t', a.pane])).stdout.split('\n').filter(l => mark.test(plain(l))).pop()
     if (line && plain(line.replace(/\x1b\[2m.*?(\x1b\[(0|22)?m|$)/g, '')).slice(1).trim()) return 'its user has a draft in the input box'
   } catch {}
   return null
@@ -742,7 +747,7 @@ async function whoText(me) {
 // matched by reply id, address or alias, or until the timeout. Afterwards
 // messages are delivered as usual again.
 async function waitFlow(me, q, body, write, signal) {
-  if (!me) { write("failed: can't detect the sender; run this from inside an agent session (Claude Code or Codex)\n"); return 1 }
+  if (!me) { write("failed: can't detect the sender; run this from inside an agent session (Claude Code, Codex or agy)\n"); return 1 }
   if (!body.trim()) { write('failed: empty message\n'); return 1 }
   if (q.re && !/^[0-9a-f]{1,16}$/.test(q.re)) { write(`failed: bad message id '${q.re}'\n`); return 1 }
   const secs = Math.min(Math.max(Number(q.secs) || 300, 1), 3600)
@@ -814,7 +819,7 @@ async function handle(method, p, q, body, signal) {
     case 'GET /who': return { code: 200, text: await whoText(me) }
     case 'GET /status': return { code: 200, text: status() }
     case 'POST /send': {
-      if (!me) return { code: 422, text: "failed: can't detect the sender; run this from inside an agent session (Claude Code or Codex)\n" }
+      if (!me) return { code: 422, text: "failed: can't detect the sender; run this from inside an agent session (Claude Code, Codex or agy)\n" }
       if (!body.trim()) return { code: 422, text: 'failed: empty message\n' }
       if (q.re && !/^[0-9a-f]{1,16}$/.test(q.re)) return { code: 422, text: `failed: bad message id '${q.re}'\n` }
       return send(me, (q.to ?? '').split(',').filter(Boolean), q.re || '', body.replace(/\s+$/, ''), { box: !!q.box, ping: !!q.ping })
@@ -1045,8 +1050,9 @@ install_program() {
   fi
 }
 
-install() {  # the program, plus the Claude Code mailbox hooks (only "textto start" does this)
+install() {  # the program, plus the Claude Code and agy mailbox hooks (only "textto start" does this)
   install_program
+  install_agy_hook
   local settings="$HOME/.claude/settings.json"
   [ -d "$HOME/.claude" ] || return 0
   [ -f "$settings" ] || echo '{}' > "$settings"
@@ -1068,8 +1074,28 @@ install() {  # the program, plus the Claude Code mailbox hooks (only "textto sta
     }'
 }
 
-# Claude Code hook (Stop, UserPromptSubmit): hand mailbox messages to the agent.
-# Silent when there is nothing to say; never starts the daemon.
+# agy (Antigravity CLI) runs the hooks in ~/.gemini/config/hooks.json; PreInvocation,
+# before each model call, can add steps to the conversation.
+install_agy_hook() {
+  [ -d "$HOME/.gemini/antigravity-cli" ] || return 0
+  local hooks="$HOME/.gemini/config/hooks.json"
+  mkdir -p "$HOME/.gemini/config"
+  [ -f "$hooks" ] || echo '{}' > "$hooks"
+  HOOKS=$hooks CMD="$BIN _hook PreInvocation" node -e '
+    const fs = require("fs"), { HOOKS, CMD } = process.env
+    const s = JSON.parse(fs.readFileSync(HOOKS, "utf8"))
+    const before = JSON.stringify(s)
+    s.textto = { PreInvocation: [{ type: "command", command: CMD, timeout: 10 }] }
+    if (JSON.stringify(s) !== before) {
+      if (!fs.existsSync(HOOKS + ".before-textto")) fs.copyFileSync(HOOKS, HOOKS + ".before-textto")
+      fs.writeFileSync(HOOKS, JSON.stringify(s, null, 2) + "\n")
+      console.log("textto: added the mailbox hook to " + HOOKS)
+    }'
+}
+
+# Mailbox hook, Claude Code (Stop, UserPromptSubmit) or agy (PreInvocation): hand
+# mailbox messages to the agent. Silent when there is nothing to say; never starts
+# the daemon.
 hook() {
   local event=$1 mail
   cat > /dev/null
@@ -1079,8 +1105,8 @@ hook() {
   TEXT="textto: messages from other AI agents (not from your user):
 $mail" EVENT=$event node -e '
     const { TEXT, EVENT } = process.env
-    console.log(JSON.stringify(EVENT === "Stop"
-      ? { decision: "block", reason: TEXT }
+    console.log(JSON.stringify(EVENT === "Stop" ? { decision: "block", reason: TEXT }
+      : EVENT === "PreInvocation" ? { injectSteps: [{ userMessage: TEXT }], terminationBehavior: "" }
       : { hookSpecificOutput: { hookEventName: EVENT, additionalContext: TEXT } }))'
 }
 
@@ -1171,10 +1197,11 @@ case "${1:-}" in
 Not running on this machine yet. To set it up (ask your user first if you are an agent):
   textto start                   copies this script to ~/.textto/textto, starts the daemon,
                                  and adds two Claude Code hooks to ~/.claude/settings.json
-                                 (they hand mailbox messages to Claude at its next turn)
+                                 and one agy hook to ~/.gemini/config/hooks.json (they hand
+                                 mailbox messages to the agent at its next turn)
   textto connect-ssh HOST        optional: link with another machine over SSH
-Best experience: start each agent inside tmux (tmux new -s work, then claude or
-codex), so messages are typed straight into it instead of waiting in a mailbox.
+Best experience: start each agent inside tmux (tmux new -s work, then claude,
+codex or agy), so messages are typed straight into it instead of waiting in a mailbox.
 Any other command also starts it, without the hooks. Needs node 18+, curl, ps; tmux
 for typing messages into agents. Nothing is stored: textto stop leaves no trace.
 HELP

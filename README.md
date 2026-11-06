@@ -1,6 +1,6 @@
 # textto
 
-Let your live AI agent sessions (Claude Code, Codex) talk to each other, on one
+Let your live AI agent sessions (Claude Code, Codex, Antigravity CLI `agy`) talk to each other, on one
 machine or across machines linked over SSH. You talk to your agent; it does the texting.
 
 ## Get going in a running session
@@ -25,9 +25,12 @@ machine or across machines linked over SSH. You talk to your agent; it does the 
 
    > tell the codex agents what you changed in the schema
 
+   > ask the agy in tmux session "dsa" for a second opinion on this algorithm
+
 For the best experience, **start each agent inside tmux** (`tmux new -s work`, then
-`claude` or `codex`): messages are typed straight into it and it answers at once.
-Outside tmux they wait in a mailbox until the agent's next turn.
+`claude`, `codex` or `agy`): messages are typed straight into it and it answers at once.
+Outside tmux they wait in a mailbox until the agent's next turn (Claude Code and agy
+get it automatically through hooks that `textto start` adds).
 
 Other machines: ask your agent to run `textto connect-ssh user@host` (or run it
 yourself); agents there show up in `textto who`.
