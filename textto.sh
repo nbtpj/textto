@@ -71,7 +71,7 @@
 # your user (and whoever runs textto) at once, with the command and its output.
 set -euo pipefail
 
-VERSION=2026110801          # yyyymmddnn; connect-ssh never replaces a newer copy
+VERSION=2026110802          # yyyymmddnn; connect-ssh never replaces a newer copy
 BIN="$HOME/.textto/textto"
 RUN="/tmp/textto-$(id -u)"  # sockets only, while the daemon runs
 SOCK="$RUN/d.sock"
@@ -783,10 +783,11 @@ const USAGE = {
   codex: { cmd: '/status', mark: /^\s*Model provider:/, busy: null, close: null,
     parse(lines) {
       const out = [], account = lines.map(l => l.match(/^\s*Account:\s+(.+?)\s*$/)?.[1]).find(Boolean)
-      for (const l of lines) {
-        const m = l.match(/^\s*(.+?) limit:\s*\[[^\]]*\]\s*([\d.]+)% left(?:\s*\((resets [^)]+)\))?/)
-        if (m) out.push({ label: m[1].toLowerCase().replace('weekly', 'week'), left: Number(m[2]), resets: m[3] })
-      }
+      // In a narrow pane the bar is left out and "(resets ...)" wraps to the next line.
+      lines.forEach((l, i) => {
+        const m = l.match(/^\s*(.+?) limit:\s*(?:\[[^\]]*\]\s*)?([\d.]+)% left(?:\s*\((resets [^)]+)\))?/)
+        if (m) out.push({ label: m[1].toLowerCase().replace('weekly', 'week'), left: Number(m[2]), resets: m[3] ?? lines[i + 1]?.match(/^\s*\((resets [^)]+)\)\s*$/)?.[1] })
+      })
       return { rows: out, account }
     } },
   // agy's footer also says "esc to cancel" while a completion menu is open (as for the
