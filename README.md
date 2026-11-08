@@ -32,6 +32,12 @@ For the best experience, **start each agent inside tmux** (`tmux new -s work`, t
 Outside tmux they wait in a mailbox until the agent's next turn (Claude Code and agy
 get it automatically through hooks that `textto start` adds).
 
+Quota: `textto usage` shows how much each claude, codex and agy agent in tmux has
+left, on every linked machine, read off its own `/usage` (codex: `/status`) panel while
+it is idle. Ask your coordinating agent things like:
+
+> check the usage of every collaborator and stop giving tasks to any under 60% left
+
 Other machines: ask your agent to run `textto connect-ssh user@host` (or run it
 yourself); agents there show up in `textto who`.
 

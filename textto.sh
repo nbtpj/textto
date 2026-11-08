@@ -53,6 +53,13 @@
 #                                   pane even in mailbox mode, once its user is idle
 #                                   ("[textto ping from you: text. N unread: ...]").
 #                                   At most one per 10 min from you to each receiver
+#   textto usage [WHO,...] [--fresh]
+#                                   quota left for claude, codex and agy agents in
+#                                   tmux, on every node (WHO: a node, an address, or
+#                                   claude/codex/agy). Read off each one's own panel
+#                                   (/usage, codex /status) typed into its pane while
+#                                   it is idle; kept 5 min (--fresh: check again).
+#                                   Busy ones are checked once idle: ask again later
 #   textto unread                   your unread count, quietly (fits a statusline)
 #   textto rename NAME              become node/NAME (fails if taken); "" resets
 #   textto me | log [--follow]      who you are, mode, unread | this node's recent log
@@ -64,7 +71,7 @@
 # your user (and whoever runs textto) at once, with the command and its output.
 set -euo pipefail
 
-VERSION=2026110601          # yyyymmddnn; connect-ssh never replaces a newer copy
+VERSION=2026110801          # yyyymmddnn; connect-ssh never replaces a newer copy
 BIN="$HOME/.textto/textto"
 RUN="/tmp/textto-$(id -u)"  # sockets only, while the daemon runs
 SOCK="$RUN/d.sock"
@@ -243,7 +250,9 @@ function onLinkMessage(link, m) {
     return
   }
   if (m.t === 'req') {
-    const work = m.op === 'relay' ? route(m.args) : m.op === 'who' ? rows(m.args?.seen ?? []) : Promise.reject(new Error(`unknown op ${m.op}`))
+    const work = m.op === 'relay' ? route(m.args) : m.op === 'who' ? rows(m.args?.seen ?? [])
+      : m.op === 'usage' ? usageRows(m.args?.seen ?? [], (m.args?.targets ?? []).filter(t => typeof t === 'string'), !!m.args?.fresh)
+      : Promise.reject(new Error(`unknown op ${m.op}`))
     Promise.resolve(work).then(value => link.send({ t: 'res', id: m.id, ok: true, value }),
       e => link.send({ t: 'res', id: m.id, ok: false, error: e.message }))
   }
@@ -364,7 +373,7 @@ function forget(pid) {
   const box = (mail.get(pid) ?? []).filter(x => Date.now() - x.at < MAIL_MS)
   if (box.length) orphans.set(aliasOf(pid), { box, at: Date.now() })
   event(`- ${aliasOf(pid)} (${idOf(pid)}) gone${box.length ? `; its ${box.length} unread wait 24 h for the next agent at ${aliasOf(pid)}` : ''}`)
-  agents.delete(pid); names.delete(pid); mail.delete(pid); recent.delete(pid); boxOnly.delete(pid)
+  agents.delete(pid); names.delete(pid); mail.delete(pid); recent.delete(pid); boxOnly.delete(pid); usage.delete(pid); later.delete(pid)
   for (const [n, p] of formerly) if (p === pid) formerly.delete(n)
 }
 
@@ -500,13 +509,14 @@ function readable(me, id, m) {
 // Typed in as one bracketed paste (load-buffer, paste-buffer -p): send-keys of a long
 // line reaches the app in pieces, and Claude Code can drop some of them. One message
 // at a time per pane.
-const panes_ = new Map()  // pane -> its last typing, to queue behind
-function typeInto(a, text) {
-  const next = (panes_.get(a.pane) ?? Promise.resolve()).catch(() => {}).then(() => pasteInto(a, text))
+const panes_ = new Map()  // pane -> its last typing (or usage check), to queue behind
+function onPane(a, work) {
+  const next = (panes_.get(a.pane) ?? Promise.resolve()).catch(() => {}).then(work)
   panes_.set(a.pane, next)
   next.catch(() => {}).finally(() => { if (panes_.get(a.pane) === next) panes_.delete(a.pane) })
   return next
 }
+const typeInto = (a, text) => onPane(a, () => pasteInto(a, text))
 async function pasteInto(a, text) {
   let tty = '', ps = []
   try {
@@ -543,20 +553,26 @@ function keep(pid, text, how = '') {
 // mailbox, marked to retry) and is typed in once the user is idle, never into
 // the middle of what they type.
 const IDLE_S = 20
-// The input line starts with the prompt mark: "❯ " in Claude Code, "> " in agy
-// (Antigravity CLI), drawn in the box above its footer. Busy agents of both kinds
-// queue what is typed in, so only a draft holds a message.
-const PROMPT = { agy: /^>(\s|$)/ }, CLAUDE_PROMPT = /^❯/
+// The input line starts with the prompt mark: "❯ " in Claude Code, "› " in Codex,
+// "> " in agy (Antigravity CLI), the lowest such line on screen. A dialog asking the
+// user to choose ("❯ 1. Yes") reads as a draft too, so nothing is typed into it.
+// Busy agents queue what is typed in, so only a draft holds a message.
+const PROMPT = { agy: /^>(\s|$)/, codex: /^›/ }, CLAUDE_PROMPT = /^❯/
+const plain = l => l.replace(/\x1b\[[0-9;]*m/g, '')
+// What the input line holds ('' when empty, null when none is on screen). A suggested
+// prompt is shown dimmed (ESC[2m) in an empty box: not a draft.
+async function inputLine(a) {
+  const screen = (await run('tmux', ['capture-pane', '-p', '-e', '-t', a.pane])).stdout.split('\n')
+  const texts = screen.filter(l => (PROMPT[a.prog] ?? CLAUDE_PROMPT).test(plain(l)))
+    .map(l => plain(l.replace(/\x1b\[2m.*?(\x1b\[(0|22)?m|$)/g, '')).slice(1).trim())
+  return { screen: screen.map(plain), text: texts.at(-1) ?? null, texts }
+}
 async function userBusy(a) {
   try {
     const sess = (await run('tmux', ['display', '-p', '-t', a.pane, '#{session_name}'])).stdout.trim()
     const keys = (await run('tmux', ['list-clients', '-t', sess, '-F', '#{client_activity}'])).stdout.split('\n').filter(Boolean).map(Number)
     if (keys.some(t => Date.now() / 1000 - t < IDLE_S)) return 'its user is typing there'
-    // Claude Code shows a suggested prompt dimmed (ESC[2m) in an empty input box: not a draft.
-    const plain = l => l.replace(/\x1b\[[0-9;]*m/g, '')
-    const mark = PROMPT[a.prog] ?? CLAUDE_PROMPT
-    const line = (await run('tmux', ['capture-pane', '-p', '-e', '-t', a.pane])).stdout.split('\n').filter(l => mark.test(plain(l))).pop()
-    if (line && plain(line.replace(/\x1b\[2m.*?(\x1b\[(0|22)?m|$)/g, '')).slice(1).trim()) return 'its user has a draft in the input box'
+    if ((await inputLine(a)).text) return 'its user has a draft in the input box'
   } catch {}
   return null
 }
@@ -742,6 +758,192 @@ async function whoText(me) {
   return all.map(r => `${r.name.padEnd(w)}  ${(r.id ?? '').padEnd(wi)}  ${r.how.padEnd(8)}  ${r.info}${r.id === mine ? '   <- you' : ''}`.trimEnd()).join('\n') + '\n'
 }
 
+// ---- usage: how much quota claude, codex and agy agents in tmux have left, read off
+// the panel each one shows for its own command (claude /usage, codex /status, agy
+// /usage), typed into the pane like a message. Claude and agy show a panel that
+// takes Esc to close, and Esc would interrupt a busy agent: those are checked only
+// while idle. Codex prints its status at once, even while it works. An agent that
+// cannot be checked now (busy, a draft, its user typing, mailbox mode) is checked
+// once it can be, within 10 min; ask again to see the result.
+const USAGE_MS = 5 * 60_000, USAGE_LATER_MS = 10 * 60_000
+const titled = g => g.split(' ').map(w => /^(AND|MODELS)$/.test(w) ? w.toLowerCase() : /^(GPT|OSS|AI)$/.test(w) ? w : w[0] + w.slice(1).toLowerCase()).join(' ')
+const USAGE = {
+  claude: { cmd: '/usage', mark: /Settings\s+Status\s+Config\s+Usage/, busy: /esc to interrupt/i, close: /Esc to cancel/,
+    parse(lines) {
+      const out = []
+      let label = null
+      for (const t of lines.map(l => l.trim())) {
+        const c = t.match(/^Current (session|week.*)$/), u = t.match(/(\d+(?:\.\d+)?)% used$/), r = t.match(/^Resets (.+)$/)
+        if (c) label = c[1]
+        else if (u && label) out.push({ label, left: 100 - Number(u[1]) })
+        else if (r && out.at(-1)?.label === label && !out.at(-1).resets) out.at(-1).resets = `resets ${r[1]}`
+      }
+      return { rows: out }
+    } },
+  codex: { cmd: '/status', mark: /^\s*Model provider:/, busy: null, close: null,
+    parse(lines) {
+      const out = [], account = lines.map(l => l.match(/^\s*Account:\s+(.+?)\s*$/)?.[1]).find(Boolean)
+      for (const l of lines) {
+        const m = l.match(/^\s*(.+?) limit:\s*\[[^\]]*\]\s*([\d.]+)% left(?:\s*\((resets [^)]+)\))?/)
+        if (m) out.push({ label: m[1].toLowerCase().replace('weekly', 'week'), left: Number(m[2]), resets: m[3] })
+      }
+      return { rows: out, account }
+    } },
+  // agy's footer also says "esc to cancel" while a completion menu is open (as for the
+  // typed /usage), so once typed, its spinner line ("⢿  Generating...") tells busy.
+  agy: { cmd: '/usage', mark: /^\s*Account:\s+\S+@/, busy: /^esc to cancel/m, busyTyped: /^\s*[\u2801-\u28ff]\s+\S/m, close: /esc Close/,
+    parse(lines) {
+      const out = [], account = lines.map(l => l.match(/^\s*Account:\s+(\S+)/)?.[1]).find(Boolean)
+      let group = '', label = null
+      for (const l of lines) {
+        const t = l.trim(), p = t.match(/\]\s*([\d.]+)%$/), r = t.match(/^Refreshes in (.+)$/)
+        if (/^[A-Z0-9][A-Z0-9 ]+$/.test(l)) group = titled(t)
+        else if (/limit/i.test(t) && !p && !/^Models within/.test(t) && t.length < 60)
+          label = /five hour|5.hour/i.test(t) ? '5h' : /week/i.test(t) ? 'week' : t
+        else if (p && label) out.push({ group, label, left: Number(p[1]) })
+        else if (r && out.length && !out.at(-1).resets) out.at(-1).resets = `refreshes in ${r[1]}`
+      }
+      return { rows: out, account }
+    } },
+}
+const usage = new Map(), later = new Map(), checking = new Set()  // pid -> last result; pid -> check until; pids being checked
+const pct = n => `${Math.round(n)}%`
+
+// Why it can't be checked right now, or null.
+async function cannotCheck(a) {
+  const u = USAGE[a.prog]
+  if (!u || a.kind !== 'tmux') return a.kind === 'tmux' ? `${a.prog} has no usage panel textto knows` : 'not in tmux, so nothing can be typed in'
+  if (boxOnly.has(a.pid)) return 'it is in mailbox mode'
+  if (flows.has(a.pid)) return 'it is in a textto wait'
+  const why = await userBusy(a)
+  if (why) return why
+  const { screen, text } = await inputLine(a)
+  if (text === null) return "its input line isn't on screen"
+  if (working(a, screen)) return 'it is working'
+  return null
+}
+// The busy marker near the bottom of the screen (claude: "esc to interrupt", agy: "esc to cancel").
+function working(a, screen, typed = false) {
+  const u = USAGE[a.prog], s = [...screen], re = typed ? u?.busyTyped ?? u?.busy : u?.busy
+  while (s.length && !s.at(-1).trim()) s.pop()
+  return !!re && re.test(s.slice(typed ? -16 : -8).join('\n'))
+}
+// A panel left open because the agent got busy meanwhile: close it once it is idle.
+function closeLater(a, u, until = Date.now() + 5 * 60_000) {
+  setTimeout(() => onPane(a, async () => {
+    if (!agents.has(a.pid)) return
+    const screen = await capture(a, 0)
+    if (!u.close.test(screen.join('\n'))) return
+    if (working(a, screen) || Date.now() > until) return Date.now() > until ? event(`usage: ${aliasOf(a.pid)}'s ${u.cmd} panel is still open`) : closeLater(a, u, until)
+    await run('tmux', ['send-keys', '-t', a.pane, 'Escape'])
+    event(`usage: closed ${aliasOf(a.pid)}'s ${u.cmd} panel`)
+  }).catch(() => {}), 2000)
+}
+
+const capture = async (a, back = 300) => (await run('tmux', ['capture-pane', '-p', '-S', `-${back}`, '-t', a.pane])).stdout.split('\n').map(l => l.trimEnd())
+const count = (lines, re) => lines.filter(l => re.test(l)).length
+async function checkUsage(a) {
+  const u = USAGE[a.prog]
+  return onPane(a, async () => {
+    let why = await cannotCheck(a)
+    if (!why) { await sleep(1500); why = await cannotCheck(a) }  // idle twice in a row, not between two steps
+    if (why) throw new Error(why)
+    const before = count(await capture(a), u.mark)
+    await run('tmux', ['send-keys', '-t', a.pane, '-l', u.cmd])
+    await sleep(600)
+    // The input line holds it (a completion menu may show below it, as in agy).
+    const { texts, screen } = await inputLine(a)
+    const busyNow = working(a, screen, true)
+    if (!texts.includes(u.cmd) || busyNow) {  // not where it should be, or it got busy: take back exactly what was typed
+      if (texts.some(t => t.endsWith(u.cmd))) {
+        await run('tmux', ['send-keys', '-t', a.pane, ...Array(u.cmd.length).fill('BSpace')])
+        await sleep(400)
+        if ((await inputLine(a)).texts.some(t => t.endsWith(u.cmd))) event(`usage: could not take ${u.cmd} back out of ${aliasOf(a.pid)}'s input line`)
+      }
+      throw new Error(busyNow ? 'it started working' : `could not type ${u.cmd} into its input line`)
+    }
+    await run('tmux', ['send-keys', '-t', a.pane, 'Enter'])
+    let got = { rows: [] }, last = ''
+    for (let i = 0; i < 25; i++) {  // up to 10 s, until the new panel's numbers settle
+      await sleep(400)
+      const lines = await capture(a)
+      if (count(lines, u.mark) <= before) continue
+      const at = lines.findLastIndex(l => u.mark.test(l))
+      got = u.parse(lines.slice(at))
+      const now = JSON.stringify(got)
+      if (got.rows.length && now === last) break
+      last = now
+    }
+    // Close the panel, only if it is what is on screen: Esc elsewhere could interrupt.
+    if (u.close) {
+      const screen = await capture(a, 0)
+      if (u.close.test(screen.join('\n'))) {
+        if (working(a, screen)) closeLater(a, u)
+        else { await run('tmux', ['send-keys', '-t', a.pane, 'Escape']); await sleep(500) }
+      }
+    }
+    if (!got.rows.length) throw new Error(`no usage numbers in its ${u.cmd} panel`)
+    const r = { ...got, at: Date.now() }
+    usage.set(a.pid, r); later.delete(a.pid)
+    event(`usage: checked ${aliasOf(a.pid)} (lowest ${pct(Math.min(...r.rows.map(x => x.left)))} left)`)
+    return r
+  })
+}
+async function tryCheck(a) {
+  if (checking.has(a.pid)) return null
+  checking.add(a.pid)
+  try { return await checkUsage(a) } finally { checking.delete(a.pid) }
+}
+// Agents that could not be checked: try again (every scan) once they can be.
+setInterval(() => {
+  for (const [pid, until] of later) {
+    const a = agents.get(pid)
+    if (!a || Date.now() > until) { later.delete(pid); continue }
+    if (!checking.has(pid)) cannotCheck(a).then(why => why ? null : tryCheck(a)).catch(() => {})
+  }
+}, 5000)
+
+function usageText(a, r, note) {
+  if (!r) return note
+  const age = Math.round((Date.now() - r.at) / 60_000), low = r.rows.reduce((m, x) => x.left < m.left ? x : m)
+  const groups = [...new Set(r.rows.map(x => x.group ?? ''))]
+  return `lowest ${pct(low.left)} left (${low.group ? `${low.group} ` : ''}${low.label})${r.account ? `  [${r.account}]` : ''}; ` +
+    groups.map(g => (g ? `${g}: ` : '') + r.rows.filter(x => (x.group ?? '') === g).map(x => `${x.label} ${pct(x.left)} left${x.resets ? ` (${x.resets})` : ''}`).join(', ')).join('; ') +
+    `  (checked ${age ? `${age} min ago` : 'just now'}${note ? `; ${note}` : ''})`
+}
+const wanted_ = (a, targets) => !targets.length || targets.some(t => t === SELF || t === a.prog || (isAddr(t) && nodeOf(t) === SELF && resolve(t) === a.pid))
+async function usageRows(seen, targets, fresh, me) {
+  const mine = [...agents.values()].filter(a => USAGE[a.prog] && wanted_(a, targets))
+  const out = await Promise.all(mine.map(async a => {
+    const r = usage.get(a.pid), row = text => ({ name: aliasOf(a.pid), id: idOf(a.pid), text })
+    if (r && !fresh && Date.now() - r.at < USAGE_MS) return row(usageText(a, r))
+    if (me?.pid === a.pid) { later.set(a.pid, Date.now() + USAGE_LATER_MS); return row(usageText(a, r, 'that is you: checked once you are idle, ask again then')) }
+    try {
+      const why = await cannotCheck(a)
+      if (why) throw new Error(why)
+      const got = await tryCheck(a) ?? r
+      return row(got ? usageText(a, got, '') : 'being checked right now; ask again in a moment')
+    } catch (e) {
+      if (a.kind === 'tmux') later.set(a.pid, Date.now() + USAGE_LATER_MS)
+      return row(usageText(a, r, `not checked now: ${e.message}${a.kind === 'tmux' ? '; checked once it can be, ask again in a few min' : ''}`))
+    }
+  }))
+  const path_ = [...seen, SELF]
+  await Promise.all([...links.values()].filter(l => !path_.includes(l.node)).map(async l => {
+    try { out.push(...await l.call('usage', { seen: path_, targets, fresh }, 30_000)) }
+    catch (e) { out.push({ name: `${l.node}/*`, id: '', text: /unknown op/.test(e.message) ? `textto ${versionOf(l.node) || '(unversioned)'} there has no usage; update it` : e.message }) }
+  }))
+  return out
+}
+async function usageReport(me, q) {
+  const targets = (q.targets ?? '').split(',').filter(Boolean), done = new Set()
+  const all = (await usageRows([], targets, !!q.fresh, me)).filter(r => !done.has(r.id || r.name) && done.add(r.id || r.name)).sort((a, b) => a.name.localeCompare(b.name))
+  if (!all.length) return `(no claude, codex or agy agents${targets.length ? ` matching ${targets.join(',')}` : ''})\n`
+  const w = Math.max(...all.map(r => r.name.length))
+  return all.map(r => `${r.name.padEnd(w)}  ${r.text}`).join('\n') +
+    '\n(% left of each quota window; agents on one account share it)\n'
+}
+
 // "textto wait": send like send-message, then let every message for this agent
 // flow in (printed as it arrives) until each receiver has sent something back,
 // matched by reply id, address or alias, or until the timeout. Afterwards
@@ -799,7 +1001,7 @@ function status() {
 // ---- local API, for the textto CLI: HTTP on a Unix socket in a 0700 folder
 
 async function handle(method, p, q, body, signal) {
-  const needsMe = ['/whois', '/who', '/send', '/wait', '/mailbox', '/rename', '/mode', '/unread'].includes(p)
+  const needsMe = ['/whois', '/who', '/send', '/wait', '/mailbox', '/rename', '/mode', '/unread', '/usage'].includes(p)
   const me = needsMe ? await identify(q) : null
   switch (`${method} ${p}`) {
     case 'GET /health': return { code: 200, text: `${SELF} ${process.env.TT_VERSION ?? 0}\n` }
@@ -817,6 +1019,7 @@ async function handle(method, p, q, body, signal) {
     }
     case 'GET /whois': return me ? { code: 200, text: `${aliasOf(me.pid)}  (${idOf(me.pid)})  ${modeText(me)}; ${(mail.get(me.pid) ?? []).length} unread\n` } : { code: 404, text: "can't detect who you are; run this from inside an agent session\n" }
     case 'GET /who': return { code: 200, text: await whoText(me) }
+    case 'GET /usage': return { code: 200, text: await usageReport(me, q) }
     case 'GET /status': return { code: 200, text: status() }
     case 'POST /send': {
       if (!me) return { code: 422, text: "failed: can't detect the sender; run this from inside an agent session (Claude Code, Codex or agy)\n" }
@@ -1152,6 +1355,9 @@ case "${1:-}" in
   connect-ssh) shift; connect_ssh "$@" ;;
   disconnect) [ $# -eq 2 ] || die "usage: textto disconnect NODE"; up; call POST "/unlink?node=$(urlencode "$2")" ;;
   who) up; call GET "/who?$(identity)" ;;
+  usage) shift; fresh="" targets=""
+    for a in "$@"; do case "$a" in --fresh) fresh=1 ;; *) targets+="${targets:+,}$a" ;; esac; done
+    up; call GET "/usage?$(identity)&targets=$(urlencode "$targets")${fresh:+&fresh=1}" ;;
   send-message|send|wait|ping) cmd=$1; shift
     as="" re="" secs=300 box="" to=""
     words=()
