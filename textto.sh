@@ -71,7 +71,7 @@
 # your user (and whoever runs textto) at once, with the command and its output.
 set -euo pipefail
 
-VERSION=2026110802          # yyyymmddnn; connect-ssh never replaces a newer copy
+VERSION=2026110803          # yyyymmddnn; connect-ssh never replaces a newer copy
 BIN="$HOME/.textto/textto"
 RUN="/tmp/textto-$(id -u)"  # sockets only, while the daemon runs
 SOCK="$RUN/d.sock"
@@ -851,28 +851,33 @@ async function checkUsage(a) {
     if (why) throw new Error(why)
     const before = count(await capture(a), u.mark)
     await run('tmux', ['send-keys', '-t', a.pane, '-l', u.cmd])
-    await sleep(600)
-    // The input line holds it (a completion menu may show below it, as in agy).
-    const { texts, screen } = await inputLine(a)
+    // The input line holds it (a completion menu may show below it, as in agy). A
+    // heavy session can take seconds to show what was typed: wait up to 3 s.
+    let texts = [], screen = []
+    for (let i = 0; i < 10 && !texts.includes(u.cmd); i++) { await sleep(300); ({ texts, screen } = await inputLine(a)) }
     const busyNow = working(a, screen, true)
     if (!texts.includes(u.cmd) || busyNow) {  // not where it should be, or it got busy: take back exactly what was typed
-      if (texts.some(t => t.endsWith(u.cmd))) {
-        await run('tmux', ['send-keys', '-t', a.pane, ...Array(u.cmd.length).fill('BSpace')])
-        await sleep(400)
-        if ((await inputLine(a)).texts.some(t => t.endsWith(u.cmd))) event(`usage: could not take ${u.cmd} back out of ${aliasOf(a.pid)}'s input line`)
+      let gone = false
+      for (let i = 0; i < 10 && !gone; i++) {
+        if ((await inputLine(a)).texts.some(t => t.endsWith(u.cmd))) {
+          await run('tmux', ['send-keys', '-t', a.pane, ...Array(u.cmd.length).fill('BSpace')])
+          gone = true
+        } else await sleep(300)
       }
+      if (!gone) event(`usage: typed ${u.cmd} into ${aliasOf(a.pid)} but never saw it in its input line; check it is not left there`)
       throw new Error(busyNow ? 'it started working' : `could not type ${u.cmd} into its input line`)
     }
     await run('tmux', ['send-keys', '-t', a.pane, 'Enter'])
-    let got = { rows: [] }, last = ''
-    for (let i = 0; i < 25; i++) {  // up to 10 s, until the new panel's numbers settle
+    let got = { rows: [] }, last = '', same = 0
+    for (let i = 0; i < 30; i++) {  // up to 12 s, until the new panel's numbers stay the same for 3 reads
       await sleep(400)
       const lines = await capture(a)
       if (count(lines, u.mark) <= before) continue
       const at = lines.findLastIndex(l => u.mark.test(l))
       got = u.parse(lines.slice(at))
       const now = JSON.stringify(got)
-      if (got.rows.length && now === last) break
+      same = now === last ? same + 1 : 0
+      if (got.rows.length && same >= 2) break
       last = now
     }
     // Close the panel, only if it is what is on screen: Esc elsewhere could interrupt.
