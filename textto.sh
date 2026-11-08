@@ -21,6 +21,8 @@
 #                                   link with the daemon on host, installing and
 #                                   starting it there if needed
 #   textto disconnect NODE | status | stop
+#   textto restart                  stop and start the daemon (to run updated code),
+#                                   keeping its unread mail, names and links
 #
 # Use, from inside an agent session (the sender is detected; if it can't be,
 # nothing is sent)
@@ -38,9 +40,11 @@
 #                                   replied (default 300 s). Don't pipe it through
 #                                   tail: copies also stay in your mailbox until the
 #                                   wait ends, so textto mailbox sees them meanwhile
-#   textto mailbox [--all]          read (and empty) your mailbox; --all also shows
-#                                   the last 20 already delivered. Claude Code and
-#                                   agy get it automatically at their next turn
+#   textto mailbox [--all | --peek] read (and empty) your mailbox; --all also shows
+#                                   the last 20 already delivered (typed in, printed by
+#                                   a wait, or read); --peek shows the unread and keeps
+#                                   them. Claude Code and agy get it automatically at
+#                                   their next turn
 #   textto mode [typed | mailbox [MINUTES]]
 #                                   how messages reach you: typed into your tmux pane
 #                                   (the default there; held while your user types or
@@ -71,7 +75,7 @@
 # your user (and whoever runs textto) at once, with the command and its output.
 set -euo pipefail
 
-VERSION=2026110803          # yyyymmddnn; connect-ssh never replaces a newer copy
+VERSION=2026110804          # yyyymmddnn; connect-ssh never replaces a newer copy
 BIN="$HOME/.textto/textto"
 RUN="/tmp/textto-$(id -u)"  # sockets only, while the daemon runs
 SOCK="$RUN/d.sock"
@@ -336,6 +340,7 @@ const orphans = new Map()  // alias -> { box, at }: unread mail of an agent that
 const mail = new Map()     // pid -> [{ id, from, env, at }], sealed
 let aliases = new Map()    // alias address -> pid
 const formerly = new Map() // alias given up by rename -> pid; still reaches it unless reused
+const departed = new Map() // alias of a tmux agent that is gone -> { pane, prog, at }: mail to it goes to the next one in that pane
 const idOf = pid => `${SELF}/${pid}`
 const aliasOf = pid => [...aliases].find(([, p]) => p === pid)?.[0] ?? idOf(pid)
 const isAlive = pid => { try { process.kill(Number(pid), 0); return true } catch (e) { return e.code === 'EPERM' } }
@@ -359,6 +364,7 @@ function reindex() {
   }
   aliases = next
   for (const [n, pid] of formerly) if (aliases.has(n) || !agents.has(pid)) formerly.delete(n)
+  for (const [n, d] of departed) if (aliases.has(n) || Date.now() - d.at > MAIL_MS) departed.delete(n)
   for (const [n, o] of orphans) {
     if (Date.now() - o.at > MAIL_MS) orphans.delete(n)
     else if (aliases.has(n)) {
@@ -370,7 +376,8 @@ function reindex() {
 }
 
 function forget(pid) {
-  const box = (mail.get(pid) ?? []).filter(x => Date.now() - x.at < MAIL_MS)
+  const box = (mail.get(pid) ?? []).filter(x => Date.now() - x.at < MAIL_MS), a = agents.get(pid)
+  if (a?.kind === 'tmux') departed.set(aliasOf(pid), { pane: a.pane, prog: a.prog, at: Date.now() })
   if (box.length) orphans.set(aliasOf(pid), { box, at: Date.now() })
   event(`- ${aliasOf(pid)} (${idOf(pid)}) gone${box.length ? `; its ${box.length} unread wait 24 h for the next agent at ${aliasOf(pid)}` : ''}`)
   agents.delete(pid); names.delete(pid); mail.delete(pid); recent.delete(pid); boxOnly.delete(pid); usage.delete(pid); later.delete(pid)
@@ -601,7 +608,7 @@ async function flush(a) {
   try {
     for (const x of (mail.get(a.pid) ?? []).filter(x => typesIn(a.pid, x))) {
       if (await userBusy(a)) break
-      const msg = opened(JSON.parse(Buffer.from(x.env, 'base64').toString()))
+      const msg = msgOf(x)
       if (x.ping) {  // one short line; the ping itself is done with
         mail.set(a.pid, (mail.get(a.pid) ?? []).filter(y => y !== x))
         const n = (mail.get(a.pid) ?? []).length
@@ -615,9 +622,13 @@ async function flush(a) {
   } catch {} finally { flushing.delete(a.pid) }
 }
 
+// Mail carried over by "textto restart" is already opened: it was sealed for the
+// previous daemon's keys, which are gone with it.
+const msgOf = x => x.plain ?? opened(JSON.parse(Buffer.from(x.env, 'base64').toString()))
+const sizeOf = x => x.env?.length ?? JSON.stringify(x.plain).length
 function toMailbox(pid, m, why, { retry = false, ping = false, held = false } = {}) {  // retry: type it in later; ping: as one line; held: by mailbox mode
   const box = (mail.get(pid) ?? []).filter(x => Date.now() - x.at < MAIL_MS)
-  if (box.reduce((n, x) => n + x.env.length, 0) + m.env.length > MAIL_BYTES)
+  if (box.reduce((n, x) => n + sizeOf(x), 0) + m.env.length > MAIL_BYTES)
     throw new Error(`mailbox full (${MAIL_BYTES / 1024} KB unread); it has to run "textto mailbox" first`)
   box.push({ id: m.id, from: m.from, env: m.env, at: Date.now(), retry, ping, held, why })
   mail.set(pid, box)
@@ -627,12 +638,31 @@ function toMailbox(pid, m, why, { retry = false, ping = false, held = false } = 
 // "textto ping": one short line typed in even in mailbox mode, but only while the
 // user is idle; at most one per sender and receiver every 10 minutes.
 const PING_MS = 10 * 60_000, pinged = new Map()  // "from>pid" -> time
+let closing = false  // set by "textto restart" once the mail is handed over
+async function recipient(to) {
+  let pid = resolve(to)
+  if (!pid) { await scan(); pid = resolve(to) }
+  if (!pid && /^\d+$/.test(to.slice(SELF.length + 1))) pid = await adopt(to.slice(SELF.length + 1))
+  if (pid) return { pid, moved: '' }
+  // A tmux agent that was restarted (or replaced) comes back under a new pid, and its
+  // name may change with it: the agent of the same program now in that pane takes it.
+  const d = departed.get(to), next = d && [...agents.values()].find(a => a.kind === 'tmux' && a.pane === d.pane && a.prog === d.prog)
+  if (next) {
+    const o = orphans.get(to)
+    if (o) { mail.set(next.pid, [...o.box, ...(mail.get(next.pid) ?? [])]); orphans.delete(to) }
+    return { pid: next.pid, moved: ` (${to} left ${waited(d)} ago; ${aliasOf(next.pid)} is the ${d.prog} now in its tmux pane)` }
+  }
+  const same = d ? [...agents.values()].filter(a => a.prog === d.prog).map(a => aliasOf(a.pid)) : []
+  throw new Error(d ? `${to} is gone (that ${d.prog} left ${waited(d)} ago); ${same.length ? `${d.prog} agents on ${SELF} now: ${same.join(', ')}` : `no ${d.prog} on ${SELF} now`}`
+    : `no agent at '${to}' (on ${SELF}: ${[...aliases.keys()].join(', ') || 'none'})`)
+}
 async function deliver(m) {
+  if (closing) throw new Error(`textto on ${SELF} is restarting; send it again in a few seconds`)
   const env = verify(m.env, m.from, m.to)
-  let pid = resolve(m.to)
-  if (!pid) { await scan(); pid = resolve(m.to) }
-  if (!pid && /^\d+$/.test(m.to.slice(SELF.length + 1))) pid = await adopt(m.to.slice(SELF.length + 1))
-  if (!pid) throw new Error(`no agent at '${m.to}' (on ${SELF}: ${[...aliases.keys()].join(', ') || 'none'})`)
+  const { pid, moved } = await recipient(m.to)
+  return (await deliverTo(m, env, pid)) + moved
+}
+async function deliverTo(m, env, pid) {
   const a = agents.get(pid), me = aliasOf(pid), msg = opened(env), both = `${me}|${idOf(pid)}`
   if (flows.has(pid)) {  // printed by its "textto wait"; a copy waits in the mailbox until the wait ends
     try { toMailbox(pid, m, '', { retry: true }) } catch {}
@@ -696,18 +726,17 @@ async function send(me, tos, re, text, { box, ping } = {}) {
     sent: results.filter(r => r.ok).map(r => ({ to: r.to, id: r.id })) }
 }
 
+function render(pid, x) {
+  try { return readable(`${aliasOf(pid)}|${idOf(pid)}`, x.id, { ...msgOf(x), queued: x.at }) }
+  catch (e) { return `[message from ${x.from}, id=${x.id}: could not be opened: ${e.message}]\n` }
+}
+const unread = pid => (mail.get(pid) ?? []).filter(x => Date.now() - x.at < MAIL_MS)
 function takeMail(pid, how) {
-  const box = (mail.get(pid) ?? []).filter(x => Date.now() - x.at < MAIL_MS)
+  const box = unread(pid)
   mail.delete(pid)
   if (box.length) event(`${aliasOf(pid)} read ${box.length} from its mailbox (${how}): ${box.map(x => x.id).join(' ')}`)
   receipts(pid, box, 'read from its mailbox')
-  return box.map(x => {
-    let t
-    try { t = readable(`${aliasOf(pid)}|${idOf(pid)}`, x.id, { ...opened(JSON.parse(Buffer.from(x.env, 'base64').toString())), queued: x.at }) }
-    catch (e) { t = `[message from ${x.from}, id=${x.id}: could not be opened: ${e.message}]\n` }
-    keep(pid, t.trimEnd(), how)
-    return t
-  }).join('')
+  return box.map(x => { const t = render(pid, x); keep(pid, t.trimEnd(), how); return t }).join('')
 }
 
 // ---- notices: this node's textto tells a sender what became of mail that waited.
@@ -1040,6 +1069,7 @@ async function handle(method, p, q, body, signal) {
     }
     case 'GET /mailbox': {
       if (!me) return { code: 404, text: "can't detect who you are; run this from inside an agent session\n" }
+      if (q.peek) return { code: 200, text: unread(me.pid).map(x => render(me.pid, x)).join('') }
       const old = q.all ? (recent.get(me.pid) ?? []).map(x => `(delivered ${new Date(x.at).toTimeString().slice(0, 8)}) ${x.text}\n`).join('') : ''
       // Mail Claude Code's hooks handed over goes into the agent's context, where it can be
       // missed or, in some session types, never arrive. An explicit read shows it again once.
@@ -1074,11 +1104,47 @@ async function handle(method, p, q, body, signal) {
       l.end?.(); l.close()
       return { code: 200, text: `disconnected from ${q.node}\n` }
     }
+    // "textto restart": the old daemon hands its state, opened, to the next one through
+    // the CLI (memory and the 0700 socket only), then exits. Mail that arrives in
+    // between is refused, so its sender sees it fail instead of losing it.
+    case 'POST /handover': {
+      closing = true
+      const opened_ = xs => xs.filter(x => Date.now() - x.at < MAIL_MS).flatMap(x => { try { return [{ ...x, env: undefined, plain: msgOf(x) }] } catch { return [] } })
+      const state = {
+        agents: [...agents.values()].map(a => ({ pid: a.pid, alias: a.alias, name: names.get(a.pid), mail: opened_(mail.get(a.pid) ?? []), recent: recent.get(a.pid) ?? [], boxOnly: boxOnly.get(a.pid) })),
+        orphans: [...orphans].map(([n, o]) => ({ n, at: o.at, box: opened_(o.box) })),
+        departed: [...departed], links: [...wanted.keys()] }
+      event('handing over to the next daemon (textto restart)')
+      setTimeout(() => process.exit(0), 100)
+      return { code: 200, text: JSON.stringify(state) }
+    }
+    case 'POST /takeover': {
+      const s = JSON.parse(body)
+      await scan()
+      let n = 0, kept = 0, lost = []
+      for (const a of s.agents ?? []) {
+        if (!agents.has(a.pid) && !await adopt(a.pid)) {
+          if (a.mail?.length) { orphans.set(a.alias ?? idOf(a.pid), { box: a.mail, at: Date.now() }); lost.push(`${a.alias ?? idOf(a.pid)} (gone): ${a.mail.length}`) }
+          continue
+        }
+        if (a.name) names.set(a.pid, a.name); else if (a.alias) agents.get(a.pid).alias = a.alias
+        if (a.mail?.length) { mail.set(a.pid, [...a.mail, ...(mail.get(a.pid) ?? [])]); n += a.mail.length; kept++ }
+        if (a.recent?.length) recent.set(a.pid, a.recent)
+        if (a.boxOnly && a.boxOnly.until > Date.now()) boxOnly.set(a.pid, a.boxOnly)
+      }
+      for (const o of s.orphans ?? []) if (o.box?.length) orphans.set(o.n, { box: o.box, at: o.at })
+      for (const [k, d] of s.departed ?? []) departed.set(k, d)
+      reindex()
+      for (const k of s.links ?? []) if (!wanted.has(k)) connect(JSON.parse(k)).catch(e => event(`relink failed: ${e.message}`))
+      const text = `took over ${n} unread for ${kept} agents${lost.length ? `; kept for a successor: ${lost.join(', ')}` : ''}; relinking ${(s.links ?? []).length} node(s)`
+      event(text)
+      return { code: 200, text: text + '\n' }
+    }
     case 'POST /stop': {
       setTimeout(() => process.exit(0), 100)
       const lost = [...mail].filter(([, b]) => b.length).map(([pid, b]) => `${aliasOf(pid)}: ${b.length} (${b.map(x => x.id).join(' ')})`)
       for (const [n, o] of orphans) lost.push(`${n} (gone): ${o.box.length}`)
-      return { code: 200, text: `textto stopped on node '${SELF}'; everything it held is gone. ${lost.length ? `Unread mail dropped: ${lost.join(', ')}` : 'No unread mail was dropped.'}\n` }
+      return { code: 200, text: `textto stopped on node '${SELF}'; everything it held is gone. ${lost.length ? `Unread mail dropped: ${lost.join(', ')} (textto restart keeps it)` : 'No unread mail was dropped.'}\n` }
     }
   }
   return { code: 404, text: 'not found\n' }
@@ -1097,7 +1163,7 @@ const api = http.createServer(async (req, res) => {
       return
     }
     let body = ''
-    for await (const c of req) { body += c; if (body.length > MAIL_BYTES) throw new Error('message too large') }
+    for await (const c of req) { body += c; if (body.length > (url.pathname === '/takeover' ? 256 * MAIL_BYTES : MAIL_BYTES)) throw new Error('message too large') }
     const ac = new AbortController()
     res.on('close', () => ac.abort())  // e.g. Ctrl-C on "textto wait"
     if (url.pathname === '/wait') {  // streamed; the exit code comes last
@@ -1238,7 +1304,7 @@ up() {
     local v
     v=$(curl -s --max-time 2 --unix-socket "$SOCK" http://textto/health | awk '{ print $2 }')
     [ "${v:-0}" -ge "$VERSION" ] 2> /dev/null \
-      || echo "textto: this machine's daemon runs older code (${v:-unversioned}; this script is $VERSION). To update it: textto stop; textto start (drops the mail it holds)" >&2
+      || echo "textto: this machine's daemon runs older code (${v:-unversioned}; this script is $VERSION). To update it: textto restart (keeps its mail)" >&2
     return 0
   fi
   # A sandbox can't start the daemon (or may not reach its socket): use the FIFOs.
@@ -1357,6 +1423,13 @@ case "${1:-}" in
   stop) alive || { echo "textto is not running"; exit 0; }
     call POST /stop
     for i in $(seq 1 40); do [ -e "$RUN" ] || break; sleep 0.25; done ;;
+  restart) alive || { up; call GET /status; exit 0; }
+    install_program  # so a daemon started meanwhile (by a link) runs this code too
+    state=$(call POST /handover) || die "the running daemon can't hand over its mail (it is older than 2026110804). textto stop; textto start updates it but drops its unread mail (see textto who)"
+    for i in $(seq 1 40); do [ -S "$SOCK" ] || break; sleep 0.25; done
+    up
+    printf '%s' "$state" | call POST /takeover -
+    call GET /status ;;
   status) up; call GET /status; echo "agents:"; call GET "/who?$(identity)" | sed 's/^/  /' ;;
   connect-ssh) shift; connect_ssh "$@" ;;
   disconnect) [ $# -eq 2 ] || die "usage: textto disconnect NODE"; up; call POST "/unlink?node=$(urlencode "$2")" ;;
@@ -1394,7 +1467,8 @@ case "${1:-}" in
     rc=0
     printf '%s' "$text" | call POST "/$([ "$cmd" = wait ] && echo wait || echo send)?$q" - || rc=$?
     exit "$rc" ;;
-  mailbox|inbox) up; out=$(call GET "/mailbox?$(identity)$([ "${2:-}" = --all ] && echo '&all=1')") || die "$out"
+  mailbox|inbox) case "${2:-}" in ""|--all|--peek) ;; *) die "usage: textto mailbox [--all | --peek]" ;; esac
+    up; out=$(call GET "/mailbox?$(identity)$(case "${2:-}" in --all) echo '&all=1' ;; --peek) echo '&peek=1' ;; esac)") || die "$out"
     [ -n "$out" ] && printf '%s\n' "$out" || echo "(mailbox empty)" ;;
   rename) [ $# -eq 2 ] || die "usage: textto rename NAME   (or rename \"\" for the default)"
     up; call POST "/rename?$(identity)&name=$(urlencode "$2")" ;;

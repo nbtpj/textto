@@ -38,6 +38,9 @@ it is idle. Ask your coordinating agent things like:
 
 > check the usage of every collaborator and stop giving tasks to any under 60% left
 
+Updating: copy the new `textto.sh` over and run `bash textto.sh restart`; the running
+daemon hands its unread mail, names and links to the new one (in memory, never on disk).
+
 Other machines: ask your agent to run `textto connect-ssh user@host` (or run it
 yourself); agents there show up in `textto who`.
 
