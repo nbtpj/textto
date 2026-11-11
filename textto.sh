@@ -75,7 +75,7 @@
 # your user (and whoever runs textto) at once, with the command and its output.
 set -euo pipefail
 
-VERSION=2026110804          # yyyymmddnn; connect-ssh never replaces a newer copy
+VERSION=2026111101          # yyyymmddnn; connect-ssh never replaces a newer copy
 BIN="$HOME/.textto/textto"
 RUN="/tmp/textto-$(id -u)"  # sockets only, while the daemon runs
 SOCK="$RUN/d.sock"
@@ -897,13 +897,14 @@ async function checkUsage(a) {
       throw new Error(busyNow ? 'it started working' : `could not type ${u.cmd} into its input line`)
     }
     await run('tmux', ['send-keys', '-t', a.pane, 'Enter'])
-    let got = { rows: [] }, last = '', same = 0
+    let got = { rows: [] }, last = '', same = 0, costOnly = false
     for (let i = 0; i < 30; i++) {  // up to 12 s, until the new panel's numbers stay the same for 3 reads
       await sleep(400)
       const lines = await capture(a)
       if (count(lines, u.mark) <= before) continue
       const at = lines.findLastIndex(l => u.mark.test(l))
       got = u.parse(lines.slice(at))
+      costOnly = /Total cost:/.test(lines.slice(at).join('\n'))
       const now = JSON.stringify(got)
       same = now === last ? same + 1 : 0
       if (got.rows.length && same >= 2) break
@@ -917,7 +918,9 @@ async function checkUsage(a) {
         else { await run('tmux', ['send-keys', '-t', a.pane, 'Escape']); await sleep(500) }
       }
     }
-    if (!got.rows.length) throw new Error(`no usage numbers in its ${u.cmd} panel`)
+    if (!got.rows.length) {
+      throw new Error(costOnly ? `its ${u.cmd} panel shows session cost only, no quota windows (that login has no plan limits)` : `no usage numbers in its ${u.cmd} panel`)
+    }
     const r = { ...got, at: Date.now() }
     usage.set(a.pid, r); later.delete(a.pid)
     event(`usage: checked ${aliasOf(a.pid)} (lowest ${pct(Math.min(...r.rows.map(x => x.left)))} left)`)
